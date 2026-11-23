@@ -1,0 +1,14 @@
+# One Compose project per environment:
+#   docker compose -p rfp-dev --env-file config/dev.env up -d
+services:
+  app:
+    image: ${IMAGE}
+    restart: unless-stopped
+    ports:
+      - "${PORT}:3000"
+    environment:
+      APP_ENV: ${APP_ENV}
+      QA_DEMO: ${QA_DEMO:-}
+      BULK_DISCOUNT_DEFAULT: ${BULK_DISCOUNT_DEFAULT}
+    volumes:
+      - ${HOME}/release-flow-pilot-data/${APP_ENV}:/data
