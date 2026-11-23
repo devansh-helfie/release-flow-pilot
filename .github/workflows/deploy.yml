@@ -1,0 +1,133 @@
+name: Deploy (shared)
+
+# Called by Deploy DEV, Deploy TEST and Promote PROD. Never run directly.
+# Application source comes from `sha`; deployment config (config/*.env, compose.yaml)
+# comes from the calling workflow's ref, which is main.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      release-tag:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.info.outputs.image }}
+    steps:
+      - name: Checkout selected source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+
+      - name: Collect build info
+        id: info
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          {
+            echo "image=ghcr.io/$GITHUB_REPOSITORY:$ENV_NAME-${SHA::7}-$GITHUB_RUN_ID"
+            echo "subject=$(git log -1 --format=%s)"
+            echo "time=$(date -u +%FT%TZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.info.outputs.image }}
+          build-args: |
+            GIT_SHA=${{ inputs.sha }}
+            RELEASE_TAG=${{ inputs.release-tag }}
+            COMMIT_SUBJECT=${{ steps.info.outputs.subject }}
+            BUILD_TIME=${{ steps.info.outputs.time }}
+            RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  deploy:
+    name: Deploy ${{ inputs.environment }}
+    needs: build
+    runs-on: [self-hosted, release-pilot-deploy]
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.start.outputs.url }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read
+    env:
+      ENV_NAME: ${{ inputs.environment }}
+      IMAGE: ${{ needs.build.outputs.image }}
+      SHA: ${{ inputs.sha }}
+      TAG: ${{ inputs.release-tag }}
+    steps:
+      - name: Checkout deploy config from main
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            config
+            compose.yaml
+          sparse-checkout-cone-mode: false
+
+      - name: Pull image
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker pull "$IMAGE"
+          docker logout ghcr.io
+
+      - name: Start container
+        id: start
+        run: |
+          PORT=$(grep '^PORT=' "config/$ENV_NAME.env" | cut -d= -f2)
+          mkdir -p "$HOME/release-flow-pilot-data/$ENV_NAME"
+          docker compose -p "rfp-$ENV_NAME" --env-file "config/$ENV_NAME.env" up -d --remove-orphans
+          echo "port=$PORT" >> "$GITHUB_OUTPUT"
+          echo "url=http://$ENV_NAME.localhost:$PORT" >> "$GITHUB_OUTPUT"
+
+      - name: Verify health and release identity
+        env:
+          PORT: ${{ steps.start.outputs.port }}
+        run: |
+          for _ in $(seq 1 30); do curl -fsS "http://localhost:$PORT/health" >/dev/null && break; sleep 1; done
+          curl -fsS "http://localhost:$PORT/version" > version.json
+          cat version.json
+          jq -e --arg sha "$SHA" --arg tag "$TAG" '.sha == $sha and .releaseTag == $tag' version.json >/dev/null \
+            || { echo "::error::Deployed identity does not match: expected $TAG @ $SHA"; exit 1; }
+
+      - name: Summary
+        env:
+          URL: ${{ steps.start.outputs.url }}
+        run: |
+          {
+            echo "### Deployed $ENV_NAME"
+            echo "- URL: $URL"
+            echo "- Release: \`$TAG\`"
+            echo "- Source: \`$SHA\`"
+            echo "- Image: \`$IMAGE\`"
+          } >> "$GITHUB_STEP_SUMMARY"

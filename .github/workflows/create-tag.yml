@@ -1,0 +1,77 @@
+name: Create tag (shared)
+
+# Called after a release PR passes DEV, by an RC re-cut, and by PROD promotion.
+# Tags are immutable: reuse only when the tag already points at the same commit, never move one.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: X.Y.Z
+        type: string
+        required: true
+      channel:
+        description: rc or stable
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+    outputs:
+      tag:
+        value: ${{ jobs.tag.outputs.tag }}
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    name: Create or reuse ${{ inputs.channel }} tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create or reuse tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          if [ "$CHANNEL" = stable ]; then
+            TAG="v$VERSION"
+            EXISTING=$(git rev-list -n1 "$TAG" 2>/dev/null || true)
+            if [ -n "$EXISTING" ] && [ "$EXISTING" != "$SHA" ]; then
+              echo "::error::$TAG already exists on $EXISTING, not on $SHA. Tags are never moved."
+              exit 1
+            fi
+          else
+            # A re-run reuses the RC already on this commit instead of creating rc.N+1.
+            TAG=$(git tag --points-at "$SHA" --list "v$VERSION-rc.*" | sort -V | tail -1)
+            if [ -z "$TAG" ]; then
+              LAST=$(git tag --list "v$VERSION-rc.*" | sed 's/.*-rc\.//' | sort -n | tail -1)
+              TAG="v$VERSION-rc.$(( ${LAST:-0} + 1 ))"
+            fi
+          fi
+
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            RESULT="Reused existing tag"
+          else
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA" >/dev/null
+            RESULT="Created tag"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "### $RESULT \`$TAG\` on \`$SHA\`"
+            if [ "$CHANNEL" = rc ]; then
+              echo "Release candidate only: stable \`v$VERSION\` is created at PROD promotion after TEST and QA pass."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

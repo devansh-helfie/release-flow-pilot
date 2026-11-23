@@ -1,0 +1,119 @@
+name: Deploy DEV
+run-name: Deploy DEV ${{ github.sha }}
+
+# Every merge to main deploys DEV. When the merge is a Release Please PR,
+# the release tag is created after DEV passes, using the selection frozen by Prepare Release.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dev:
+    name: DEV
+    uses: ./.github/workflows/deploy.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      environment: dev
+      sha: ${{ github.sha }}
+      release-tag: unreleased
+
+  find-release:
+    name: Find release selection
+    needs: dev
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      pr: ${{ steps.pr.outputs.pr }}
+      channel: ${{ steps.selection.outputs.channel }}
+      source_sha: ${{ steps.selection.outputs.source_sha }}
+      version: ${{ steps.selection.outputs.version }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find merged release PR for this commit
+        id: pr
+        run: |
+          PR=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            --jq '[.[] | select(any(.labels[]; .name == "autorelease: pending"))][0].number // empty')
+          if [ -z "$PR" ]; then
+            echo "Not a pending release PR merge. Nothing to publish." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+
+      - name: Read frozen release selection
+        id: selection
+        if: steps.pr.outputs.pr != ''
+        env:
+          PR: ${{ steps.pr.outputs.pr }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100" \
+            --jq '[.[] | select(.body | contains("<!-- release-selection -->"))] | last | .body // ""' > selection.md
+          # shellcheck disable=SC2016 # backticks are the literal markdown code fence
+          JSON=$(sed -n '/^```json$/,/^```$/p' selection.md | sed '1d;$d')
+          [ -n "$JSON" ] || { echo "::error::Release PR #$PR has no release selection comment. Run Prepare Release again."; exit 1; }
+
+          CHANNEL=$(jq -r .channel <<<"$JSON")
+          SOURCE_SHA=$(jq -r .source_sha <<<"$JSON")
+          [ "$SOURCE_SHA" = merge ] && SOURCE_SHA=$GITHUB_SHA
+          VERSION=$(jq -r '."."' .release-please-manifest.json)
+          echo "Selection from PR #$PR: $JSON"
+
+          {
+            echo "channel=$CHANNEL"
+            echo "source_sha=$SOURCE_SHA"
+            echo "version=$VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Require DEV success for an older selected source
+        if: steps.selection.outputs.source_sha != '' && steps.selection.outputs.source_sha != github.sha
+        env:
+          SHA: ${{ steps.selection.outputs.source_sha }}
+        run: |
+          LATEST=$(gh run list --workflow deploy-dev.yml --commit "$SHA" --limit 20 \
+            --json databaseId,status,conclusion,startedAt --jq 'sort_by(.startedAt) | last // empty')
+          [ -n "$LATEST" ] || { echo "::error::No DEV run found for $SHA"; exit 1; }
+          jq -e '.status == "completed" and .conclusion == "success"' <<<"$LATEST" >/dev/null \
+            || { echo "::error::Latest DEV run for $SHA is not successful: $LATEST"; exit 1; }
+
+  publish:
+    name: Publish release tag
+    needs: find-release
+    if: needs.find-release.outputs.pr != ''
+    uses: ./.github/workflows/create-tag.yml
+    permissions:
+      contents: write
+    with:
+      version: ${{ needs.find-release.outputs.version }}
+      channel: ${{ needs.find-release.outputs.channel }}
+      sha: ${{ needs.find-release.outputs.source_sha }}
+
+  mark-tagged:
+    name: Mark release PR tagged
+    needs: [find-release, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ needs.find-release.outputs.pr }}
+      TAG: ${{ needs.publish.outputs.tag }}
+    steps:
+      - name: Update release PR label
+        run: |
+          gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --remove-label "autorelease: pending" --add-label "autorelease: tagged"
+          {
+            echo "### Release PR #$PR published as \`$TAG\`"
+            echo "Next: run **Deploy TEST** with release-tag \`$TAG\`."
+          } >> "$GITHUB_STEP_SUMMARY"
