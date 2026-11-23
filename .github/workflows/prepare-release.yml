@@ -1,0 +1,209 @@
+name: Prepare Release
+run-name: Prepare Release (${{ inputs.mode }}, ${{ inputs.channel }})
+
+# new-release: Release Please opens or updates the version/changelog PR, and the release
+#   selection (channel + frozen source SHA) is saved as a comment on it. Merging that PR deploys
+#   DEV, and Deploy DEV then creates the tag automatically.
+# recut-rc: tags the next RC of the current version (for example v0.2.0-rc.2) on a newer main
+#   commit, after a failed RC. No release PR.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [new-release, recut-rc]
+        default: new-release
+      channel:
+        description: rc creates vX.Y.Z-rc.N, stable creates vX.Y.Z
+        type: choice
+        options: [rc, stable]
+        default: rc
+      source-ref:
+        description: Optional main commit or ref. Blank = release PR merge commit (new-release) or main HEAD (recut-rc)
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Check state and freeze source
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MODE: ${{ inputs.mode }}
+      CHANNEL: ${{ inputs.channel }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Stop if a merged release is still waiting for its tag
+        run: |
+          PENDING=$(gh pr list --state merged --label "autorelease: pending" --json number,mergeCommit --jq '.[0] // empty')
+          if [ -n "$PENDING" ]; then
+            PR=$(jq -r .number <<<"$PENDING")
+            RUN=$(gh run list --workflow deploy-dev.yml --commit "$(jq -r .mergeCommit.oid <<<"$PENDING")" --limit 1 --json url --jq '.[0].url // "not found"')
+            echo "::error::Release PR #$PR is merged but not tagged yet. Resume it by re-running the failed jobs of its Deploy DEV run: $RUN"
+            exit 1
+          fi
+
+      - name: Check mode and channel
+        if: inputs.mode == 'recut-rc' && inputs.channel == 'stable'
+        run: |
+          echo "::error::recut-rc only creates RC tags. A stable tag cannot be re-cut because vX.Y.Z would need a second commit."
+          exit 1
+
+      - name: Resolve and freeze source
+        id: source
+        env:
+          SOURCE_REF: ${{ inputs.source-ref }}
+        run: |
+          REF=$(echo "$SOURCE_REF" | xargs)
+          if [ -z "$REF" ] && [ "$MODE" = new-release ]; then
+            echo "sha=merge" >> "$GITHUB_OUTPUT"
+            echo "Source: the release PR merge commit." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          SHA=$(git rev-parse --verify "${REF:-origin/main}^{commit}") \
+            || { echo "::error::Cannot resolve source-ref '$REF'"; exit 1; }
+          git merge-base --is-ancestor "$SHA" origin/main \
+            || { echo "::error::$SHA is not on main. Only main commits can be released."; exit 1; }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Source frozen: \`$SHA\` (from '${REF:-main HEAD}')." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require DEV success for the selected source
+        if: steps.source.outputs.sha != 'merge'
+        env:
+          SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          LATEST=$(gh run list --workflow deploy-dev.yml --commit "$SHA" --limit 20 \
+            --json databaseId,status,conclusion,startedAt --jq 'sort_by(.startedAt) | last // empty')
+          [ -n "$LATEST" ] || { echo "::error::No DEV run found for $SHA"; exit 1; }
+          jq -e '.status == "completed" and .conclusion == "success"' <<<"$LATEST" >/dev/null \
+            || { echo "::error::Latest DEV run for $SHA is not successful: $LATEST"; exit 1; }
+
+      - name: Current version (recut-rc)
+        id: version
+        if: inputs.mode == 'recut-rc'
+        run: |
+          VERSION=$(jq -r '."."' .release-please-manifest.json)
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::v$VERSION is already released as stable. Ship the fix as a new release (mode new-release)."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  release-pr:
+    name: Release Please PR
+    needs: resolve
+    if: inputs.mode == 'new-release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Create or update release PR
+        uses: googleapis/release-please-action@v4
+        with:
+          skip-github-release: true
+
+      - name: Find release PR
+        id: pr
+        run: |
+          gh pr list -R "$GITHUB_REPOSITORY" --state open --label "autorelease: pending" \
+            --json number,headRefOid --jq '.[0] // {} | "number=\(.number // "")\nhead=\(.headRefOid // "")"' >> "$GITHUB_OUTPUT"
+          if grep -q '^number=$' "$GITHUB_OUTPUT"; then
+            echo "Nothing releasable since the last release (only non-releasing commits such as docs, ci, chore)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Save release selection on the PR
+        if: steps.pr.outputs.number != ''
+        env:
+          PR: ${{ steps.pr.outputs.number }}
+          CHANNEL: ${{ inputs.channel }}
+          SOURCE_REF: ${{ inputs.source-ref }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+        run: |
+          JSON=$(jq -n --arg channel "$CHANNEL" --arg ref "$SOURCE_REF" --arg sha "$SOURCE_SHA" --arg run "$GITHUB_RUN_ID" \
+            '{channel: $channel, source_ref: $ref, source_sha: $sha, prepared_run: $run}')
+          # shellcheck disable=SC2016 # backticks are the literal markdown code fence
+          BODY=$(printf '<!-- release-selection -->\n**Release selection** (read by Deploy DEV after this PR merges)\n\n```json\n%s\n```\n' "$JSON")
+          ID=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100" \
+            --jq '[.[] | select(.body | contains("<!-- release-selection -->"))] | last | .id // empty')
+          if [ -n "$ID" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$ID" -f body="$BODY" >/dev/null
+          else
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$BODY" >/dev/null
+          fi
+
+      - name: Checkout release PR
+        if: steps.pr.outputs.number != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head }}
+
+      - uses: actions/setup-node@v4
+        if: steps.pr.outputs.number != ''
+        with:
+          node-version: 22
+
+      # PRs opened with GITHUB_TOKEN do not trigger PR checks, so this job tests the
+      # release PR and reports the required pr-checks status itself.
+      - name: Unit tests
+        id: tests
+        if: steps.pr.outputs.number != ''
+        continue-on-error: true
+        run: node --test
+
+      - name: Report pr-checks status
+        if: steps.pr.outputs.number != ''
+        env:
+          HEAD: ${{ steps.pr.outputs.head }}
+          OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          STATE=$([ "$OUTCOME" = success ] && echo success || echo failure)
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD" -f state="$STATE" -f context=pr-checks \
+            -f description="Tested by Prepare Release" -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >/dev/null
+          [ "$STATE" = success ] || exit 1
+
+      - name: Summary
+        if: steps.pr.outputs.number != ''
+        env:
+          PR: ${{ steps.pr.outputs.number }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          VERSION=$(jq -r '."."' .release-please-manifest.json)
+          {
+            echo "### Release PR #$PR prepares $VERSION ($CHANNEL)"
+            echo "Review and merge it. Deploy DEV then creates the tag automatically."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  recut:
+    name: Re-cut RC
+    needs: resolve
+    if: inputs.mode == 'recut-rc'
+    uses: ./.github/workflows/create-tag.yml
+    permissions:
+      contents: write
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      channel: rc
+      sha: ${{ needs.resolve.outputs.source_sha }}
