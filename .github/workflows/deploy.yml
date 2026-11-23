@@ -23,7 +23,8 @@ permissions:
 jobs:
   build:
     name: Build image
-    runs-on: ubuntu-latest
+    # arm64 to match the Mac deploy runner (free for public repos).
+    runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
@@ -78,7 +79,6 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
-      packages: read
     env:
       ENV_NAME: ${{ inputs.environment }}
       IMAGE: ${{ needs.build.outputs.image }}
@@ -94,17 +94,12 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Pull image
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # The runner service cannot use the macOS keychain, so keep GHCR credentials in a
-          # job-only file config and talk to Docker Desktop's socket directly.
-          export DOCKER_CONFIG="$RUNNER_TEMP/docker-config" DOCKER_HOST="unix://$HOME/.docker/run/docker.sock"
-          mkdir -p "$DOCKER_CONFIG" && echo '{}' > "$DOCKER_CONFIG/config.json"
-          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker pull "$IMAGE"
-          docker logout ghcr.io
-          rm -rf "$DOCKER_CONFIG"
+          # The GHCR package is public: pull anonymously with an empty Docker config and no
+          # credential helper on PATH, because the runner service cannot use the macOS keychain.
+          mkdir -p "$RUNNER_TEMP/docker-config" && echo '{}' > "$RUNNER_TEMP/docker-config/config.json"
+          PATH=/usr/bin:/bin DOCKER_CONFIG="$RUNNER_TEMP/docker-config" \
+            DOCKER_HOST="unix://$HOME/.docker/run/docker.sock" "$HOME/.docker/bin/docker" pull "$IMAGE"
 
       - name: Start container
         id: start
